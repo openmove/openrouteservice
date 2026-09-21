@@ -5,49 +5,45 @@ name: Java CI with Maven
 
 on:
   push:
-    branches: [ master ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ master ]
+    branches: [ "**" ]
+
+permissions: {}
 
 jobs:
   run_tests:
+    permissions:
+      contents: read
+    name: Run unit and integration tests
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-    - name: Set up JDK
-      uses: actions/setup-java@v1
-      with:
-        java-version: 11
-    - name: Cache SonarCloud packages
-      uses: actions/cache@v1
-      with:
-        path: ~/.sonar/cache
-        key: ${{ runner.os }}-sonar
-        restore-keys: ${{ runner.os }}-sonar
-    - name: Cache Maven packages
-      uses: actions/cache@v2
-      with:
-        path: ~/.m2
-        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-        restore-keys: ${{ runner.os }}-m2
-    - name: Copy ors test config for API tests
-      run: cp ./openrouteservice-api-tests/conf/ors-config-test.json ./openrouteservice/src/main/resources/ors-config.json
-    - name: Test, build, run API tests
-      run: mvn -B -f openrouteservice/pom.xml verify jacoco:report
-    - name: run SonarLint checks
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      if: env.SONAR_TOKEN != null
-      run: mvn -B -f openrouteservice/pom.xml org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
-    - name: Rocket.Chat Notification
-      uses: RocketChat/Rocket.Chat.GitHub.Action.Notification@1.1.1
-      env:
-        ROCKETCHAT_WEBHOOK: ${{ secrets.ROCKETCHAT_WEBHOOK }}
-      if: env.ROCKETCHAT_WEBHOOK != null
-      with:
-        type: ${{ job.status }}
-        job_name: '*ORS CI Test*'
-        token: ${{ secrets.PROJECT_AUTOMATION }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-environment
+        with:
+          with_java: 'true'
+          java_version: 25
+          with_docker: 'false'
+      - name: Cache SonarCloud packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-sonar
+      - name: run unit tests
+        run: ./mvnw -B install -Papitests -T $(nproc) -DCI=true
+      - name: Run the unit tests a second time with jacoco
+        run: |
+          # Ensure test stability across graph reloads.
+          ./mvnw -B verify -Papitests -T $(nproc) jacoco:report
+      - name: 'Prepare Sonar analysis'
+        uses: evaristegalois11/sonar-fork-analysis@9d67a15f17407c3bf39bb09c39a9d5d3794eeecd # v1
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+          project-key: 'GIScience_openrouteservice'

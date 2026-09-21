@@ -1,60 +1,197 @@
-FROM openjdk:11-jdk
+FROM docker.io/maven:3.9.16-amazoncorretto-25@sha256:98295c180adc4b5c0a52b830e00c387c862d5827d395cd7737d8205170428785 AS build
+# ============================================================================
+# Build stage for Java-based ORS application
+# This stage is responsible for compiling and packaging the Java-based OpenRouteService (ORS) application.
+# ============================================================================
+ARG DEBIAN_FRONTEND=noninteractive
 
-ENV MAVEN_OPTS="-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true"
-ENV MAVEN_CLI_OPTS="--batch-mode --errors --fail-at-end --show-version -DinstallAtEnd=true -DdeployAtEnd=true"
+# hadolint ignore=DL3002
+USER root
 
-ARG ORS_CONFIG=./openrouteservice/src/main/resources/ors-config-sample.json
-ARG OSM_FILE=./openrouteservice/src/main/files/heidelberg.osm.gz
-ARG BUILD_GRAPHS="False"
+# The `slim` stage has no JDK of its own. Its base ships the native libraries a
+# JVM needs but no JVM. So the runtime is built here and copied in.
+# /empty-tmp exists because the distroless base ships no /tmp at all and COPY
+# cannot create a directory.
+RUN dnf install -y binutils tar && \
+    jlink --add-modules java.se,jdk.unsupported,jdk.crypto.ec \
+    --strip-debug --no-man-pages --no-header-files --compress=zip-6 \
+    --output /javaruntime && \
+    mkdir -m 1777 /empty-tmp && \
+    dnf clean all
+
+WORKDIR /tmp/ors
+
+COPY ors-api/pom.xml /tmp/ors/ors-api/pom.xml
+COPY ors-engine/pom.xml /tmp/ors/ors-engine/pom.xml
+COPY pom.xml /tmp/ors/pom.xml
+COPY ors-report-aggregation/pom.xml /tmp/ors/ors-report-aggregation/pom.xml
+COPY ors-test-scenarios/pom.xml /tmp/ors/ors-test-scenarios/pom.xml
+COPY ors-benchmark/pom.xml /tmp/ors/ors-benchmark/pom.xml
+COPY mvnw /tmp/ors/mvnw
+COPY .mvn /tmp/ors/.mvn
+
+# Download dependencies
+ARG MAVEN_OPTS="-Dmaven.repo.local=/root/.m2/repository"
+ENV MAVEN_OPTS="${MAVEN_OPTS}"
+RUN ./mvnw -pl 'ors-api,ors-engine' -q \
+    dependency:resolve dependency:resolve-plugins -Dmaven.test.skip=true > /dev/null || true
+
+COPY ors-api /tmp/ors/ors-api
+COPY ors-engine /tmp/ors/ors-engine
+
+# Build the project
+RUN ./mvnw -pl 'ors-api,ors-engine' \
+    -q clean package -DskipTests -Dmaven.test.skip=true
+
+FROM docker.io/golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build-go
+# ============================================================================
+# Build stage for Go-based tools
+# This stage is dedicated to building Go-based tools required in later stages.
+# ============================================================================
+
+RUN GO111MODULE=on go install github.com/mikefarah/yq/v4@v4.53.3
+
+FROM docker.io/amazoncorretto:25.0.4-alpine3.24@sha256:2ad5f5cf03a3970f2478b130dc28f51b179ce13c58154fe3ec1a6fdeb3b86e3a AS base
+# ============================================================================
+# Base image stage: common setup for all runtime stages
+# This stage sets up the foundational environment for running the OpenRouteService (ORS) application.
+# ============================================================================
+
 ARG UID=1000
-ARG TOMCAT_VERSION=8.5.69
+ARG GID=1000
+ARG ORS_HOME=/home/ors
 
-# Create user
-RUN useradd -u $UID -md /ors-core ors
+# Setup user and directory structure
+RUN addgroup ors -g ${GID} && \
+    adduser -D -u ${UID} --system -G ors ors && \
+    mkdir -p ${ORS_HOME}/logs ${ORS_HOME}/files ${ORS_HOME}/graphs ${ORS_HOME}/elevation_cache ${ORS_HOME}/app && \
+    chown -R ors:0 ${ORS_HOME} && \
+    chmod -R u+rwX,g=u ${ORS_HOME}
 
-# Create directories
-RUN mkdir /usr/local/tomcat /ors-conf /var/log/ors && \
-    chown ors:ors /usr/local/tomcat /ors-conf /var/log/ors
+# Set the default language
+ENV LANG='en_US' LANGUAGE='en_US' LC_ALL='en_US' \
+    ORS_HOME=${ORS_HOME}
 
-# Install dependencies and locales
-RUN apt-get update -qq && \
-    apt-get install -qq -y locales nano maven moreutils jq && \
-    rm -rf /var/lib/apt/lists/* && \
-    locale-gen en_US.UTF-8
+WORKDIR ${ORS_HOME}
 
-USER ors:ors
-WORKDIR /ors-core
+# Expose port
+EXPOSE 8082
 
-COPY --chown=ors:ors openrouteservice /ors-core/openrouteservice
-COPY --chown=ors:ors $OSM_FILE /ors-core/data/osm_file.pbf
-COPY --chown=ors:ors $ORS_CONFIG /ors-core/openrouteservice/src/main/resources/ors-config-sample.json
-COPY --chown=ors:ors ./docker-entrypoint.sh /ors-core/docker-entrypoint.sh
+HEALTHCHECK --start-period=60s --interval=10s --timeout=2s CMD ["sh", "-c", "wget --quiet --tries=1 --spider http://localhost:8082/ors/v2/health || exit 1"]
 
-# Install tomcat
-RUN wget -q https://archive.apache.org/dist/tomcat/tomcat-8/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz -O /tmp/tomcat.tar.gz && \
-    cd /tmp && \
-    tar xvfz tomcat.tar.gz && \
-    cp -R /tmp/apache-tomcat-${TOMCAT_VERSION}/* /usr/local/tomcat/ && \
-    rm -r /tmp/tomcat.tar.gz /tmp/apache-tomcat-${TOMCAT_VERSION}
+LABEL org.opencontainers.image.source="https://github.com/GIScience/openrouteservice"
+LABEL org.opencontainers.image.licenses="LGPL-3.0-only"
+LABEL org.opencontainers.image.title="openrouteservice"
+LABEL org.opencontainers.image.description="Open-source route planning service based on OpenStreetMap data"
+LABEL org.opencontainers.image.documentation="https://giscience.github.io/openrouteservice"
 
-# Configure ors config
-RUN cp /ors-core/openrouteservice/src/main/resources/ors-config-sample.json /ors-core/openrouteservice/src/main/resources/ors-config.json && \
-    # Replace paths in ors-config.json to match docker setup
-    jq '.ors.services.routing.sources[0] = "data/osm_file.pbf"' /ors-core/openrouteservice/src/main/resources/ors-config.json |sponge /ors-core/openrouteservice/src/main/resources/ors-config.json && \
-    jq '.ors.services.routing.profiles.default_params.elevation_cache_path = "data/elevation_cache"' /ors-core/openrouteservice/src/main/resources/ors-config.json |sponge /ors-core/openrouteservice/src/main/resources/ors-config.json && \
-    jq '.ors.services.routing.profiles.default_params.graphs_root_path = "data/graphs"' /ors-core/openrouteservice/src/main/resources/ors-config.json |sponge /ors-core/openrouteservice/src/main/resources/ors-config.json && \
-    # init_threads = 1, > 1 been reported some issues
-    jq '.ors.services.routing.init_threads = 1' /ors-core/openrouteservice/src/main/resources/ors-config.json |sponge /ors-core/openrouteservice/src/main/resources/ors-config.json && \
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c AS slim
+# ============================================================================
+# K8s-ready image stage
+# This stage is optimized for Kubernetes and container deployments with:
+# - Java as PID 1 for proper signal handling
+# - Direct Logging to STDOUT/STDERR
+# - Non-root execution
+# - Absolute minimal footprint
+# - No config presets or example data
+# - Distroless, cosign-attested Debian 13 base: no shell, no package manager,
+#   so nothing here can RUN; everything arrives via COPY.
+# ============================================================================
 
-    # Delete all profiles but car
-    jq 'del(.ors.services.routing.profiles.active[1,2,3,4,5,6,7,8])' /ors-core/openrouteservice/src/main/resources/ors-config.json |sponge /ors-core/openrouteservice/src/main/resources/ors-config.json
+ARG ORS_HOME=/home/ors
 
-# Make all directories writable, to allow the usage of other uids via "docker run -u"
-RUN chmod -R go+rwX /ors-core /ors-conf /usr/local/tomcat /var/log/ors
+COPY --from=build --chown=1001:0 /javaruntime /opt/java
+# HEALTHCHECK probe. Preferred over copying curl or busybox in, which drag a general
+# purpose download tool or an entire shell back into a deliberately shell-less
+# base.
+COPY --from=ghcr.io/tarampampam/microcheck:1.4.0@sha256:c9f79cd408626de7c10f2d487d67339f49adf0ba61dde96ede65343269db1f85 \
+    --chown=1001:0 --chmod=755 /bin/httpcheck /usr/bin/httpcheck
+COPY --from=base --chown=1001:0 ${ORS_HOME} ${ORS_HOME}
+COPY --chown=1001:0 --chmod=644 --from=build /tmp/ors/ors-api/target/ors.jar /ors.jar
+COPY --from=build --chown=1001:0 --chmod=1777 /empty-tmp /tmp
 
-# Define volumes
-VOLUME ["/ors-core/data/graphs", "/ors-core/data/elevation_cache", "/ors-conf", "/usr/local/tomcat/logs", "/var/log/ors"]
+ENV PATH="/opt/java/bin:${PATH}" \
+    LANG='en_US' LANGUAGE='en_US' LC_ALL='en_US' \
+    ORS_HOME=${ORS_HOME} \
+    LOGGING_FILE_NAME="" \
+    XDG_CACHE_HOME=/tmp
+
+# Apache Tomcat hardening: pinned response settings, shorter connector timeout, no Swagger UI or OpenAPI document
+ENV SERVER_SERVER_HEADER="" \
+    SERVER_ERROR_INCLUDE_STACKTRACE=never \
+    SERVER_ERROR_INCLUDE_MESSAGE=never \
+    SERVER_ERROR_INCLUDE_EXCEPTION=false \
+    SERVER_ERROR_INCLUDE_BINDING_ERRORS=never \
+    SERVER_MAX_HTTP_REQUEST_HEADER_SIZE=8KB \
+    SERVER_TOMCAT_CONNECTION_TIMEOUT=20s \
+    SPRINGDOC_SWAGGER_UI_ENABLED=false \
+    SPRINGDOC_API_DOCS_ENABLED=false
+
+WORKDIR ${ORS_HOME}
+
+EXPOSE 8082
+
+# We need a custom health check as the base image comes without any binaries.
+# httpcheck is one of the emerging standard tools.
+HEALTHCHECK --start-period=60s --interval=30s --timeout=8s CMD ["/usr/bin/httpcheck", \
+    "--port-env", "SERVER_PORT", "--timeout-env", "ORS_HEALTHCHECK_TIMEOUT", \
+    "--connect-timeout", "1", "http://localhost:8082/ors/v2/health"]
+
+# Switch to a non-root user, declared numerically and above 1000.
+USER 1001:0
+
+# Run Java jar directly as PID 1
+# Configuration via environment variables:
+# - JDK_JAVA_OPTIONS: additional JVM options
+# - Server settings via Spring properties (e.g., server.port, server.servlet.context-path)
+# - Logging via Spring properties (logging.level.*, logging.pattern.*)
+ENTRYPOINT ["java", "-jar", "/ors.jar"]
+
+FROM base AS publish
+# ============================================================================
+# Convenient ORS publish image
+# This stage is optimized for easy publishing and self-hosting in non-Kubernetes environments.
+# It includes more components and configurations to facilitate quick setup and deployment:
+# - Necessary runtime dependencies
+# - Example configuration files and data
+# - Entrypoint scripts for easy startup
+# - Container configuration validations
+# - Informative/verbose container logging
+# ============================================================================
+
+# Build ARGS
+ARG OSM_FILE=./ors-api/src/test/files/heidelberg.test.pbf
+
+# Copy over the needed bits and pieces from the other stages.
+COPY --chown=ors:ors --chmod=755 ./$OSM_FILE /heidelberg.test.pbf
+COPY --chown=ors:ors --chmod=755 ./docker-entrypoint.sh /entrypoint.sh
+COPY --chown=ors:ors --from=build-go /go/bin/yq /bin/yq
+# Copy JAR from build stage. Read-only data: docker-entrypoint.sh starts it with
+# `java -jar`, never by executing it, so no execute bit is needed here either.
+COPY --chown=ors:0 --chmod=644 --from=build /tmp/ors/ors-api/target/ors.jar /ors.jar
+
+
+# Setup additional packages for publish stage and allow read access to others
+RUN apk add --no-cache bash=~5 jq=~1 openssl=~3 && \
+    chmod -R o-rwx ${ORS_HOME}
+
+# Copy the example config files to the build folder
+COPY --chown=ors:ors --chmod=755 ./ors-config.yml /example-ors-config.yml
+COPY --chown=ors:ors --chmod=755 ./ors-config.env /example-ors-config.env
+
+# Rewrite the example config to use the right files in the container
+RUN yq -i -p=props -o=props \
+    '.ors.engine.profile_default.build.source_file="/home/ors/files/example-heidelberg.test.pbf"' \
+    /example-ors-config.env && \
+    yq -i e '.ors.engine.profile_default.build.source_file = "/home/ors/files/example-heidelberg.test.pbf"' \
+    /example-ors-config.yml
+
+ENV BUILD_GRAPHS="False"
+ENV REBUILD_GRAPHS="False"
+# Set the ARG to an ENV. Else it will be lost.
+ENV ORS_HOME=${ORS_HOME}
+
+WORKDIR ${ORS_HOME}
 
 # Start the container
-EXPOSE 8080
-ENTRYPOINT ["/bin/bash", "/ors-core/docker-entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,66 @@
+/*
+ * This file is part of Openrouteservice.
+ *
+ * Openrouteservice is free software; you can redistribute it and/or modify it under the terms of the
+ * GNU Lesser General Public License as published by the Free Software Foundation; either version 2.1
+ * of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ * without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License along with this library;
+ * if not, see <https://www.gnu.org/licenses/>.
+ */
+
+package org.heigit.ors.api.responses.routing.geojson;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import io.swagger.v3.oas.annotations.media.Schema;
+import org.heigit.ors.api.requests.routing.RouteRequest;
+import org.heigit.ors.api.responses.routing.JSONBasedIndividualRouteResponse;
+import org.heigit.ors.api.responses.routing.json.JSONSegment;
+import org.heigit.ors.exceptions.StatusCodeException;
+import org.heigit.ors.geojson.GeometryJSON;
+import org.heigit.ors.routing.RouteResult;
+
+import java.util.List;
+import java.util.Map;
+
+public class GeoJSONIndividualRouteResponse extends JSONBasedIndividualRouteResponse {
+    @Schema(description = "A GeoJSON 'Feature' representing a single route returned from the request")
+    @JsonProperty("type")
+    public final String type = "Feature";
+
+    @JsonProperty("properties")
+    private final GeoJSONSummary properties;
+
+    public GeoJSONIndividualRouteResponse(RouteResult routeResult, RouteRequest request) throws StatusCodeException {
+        super(routeResult, request);
+        List<JSONSegment> segments = constructSegments(routeResult, request);
+
+        Map extras = constructExtras(request, routeResult);
+
+        properties = new GeoJSONSummary(routeResult, segments, extras, this.includeElevation, this.isPtRequest, constructLegs(routeResult));
+    }
+
+    @Schema(description = "The geometry of the route. For GeoJSON route responses this is a JSON LineString.")
+    @JsonProperty("geometry")
+    public GeoJSONGeometry getGeometry() {
+        return new GeoJSONGeometry("LineString", GeometryJSON.toJSON(this.routeCoordinates, includeElevation));
+    }
+
+    @JsonProperty("properties")
+    @Schema(description = "Contains routing segments with navigation steps, overall route summary, waypoint indices, and related metadata.")
+    public GeoJSONSummary getProperties() {
+        return properties;
+    }
+
+    @JsonProperty("bbox")
+    @Schema(description = "Bounding box that covers all returned routes", example = "[49.414057, 8.680894, 49.420514, 8.690123]")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public double[] getBBox() {
+        return bbox.getAsArray();
+    }
+}
